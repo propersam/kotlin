@@ -406,6 +406,34 @@ class KtLightAnnotationTest : KotlinLightCodeInsightFixtureTestCase() {
         TestCase.assertEquals(elementByText.startOffsetInParent, memberValue.startOffsetInParent)
     }
 
+    fun testLiteralIdentity() {
+        myFixture.addClass("""
+            import java.lang.annotation.ElementType;
+            import java.lang.annotation.Target;
+
+            @Target(ElementType.PARAMETER)
+            public @interface Anno1 {
+                String str();
+            }
+        """.trimIndent())
+
+        myFixture.configureByText("AnnotatedClass.kt", """
+            @Anno1(str = "someText")
+            class AnnotatedClass
+        """.trimIndent())
+
+        val clazz1 = myFixture.findClass("AnnotatedClass")
+        val clazz2 = myFixture.findClass("AnnotatedClass")
+        TestCase.assertSame("light classes should be the same when retrived twice", clazz1, clazz2)
+        val (annotation1) = clazz1.expectAnnotations(1)
+        val (annotation2) = clazz2.expectAnnotations(1)
+        TestCase.assertSame("light annotations should be the same when called twice", annotation1, annotation2)
+        TestCase.assertSame("light values should be the same when called twice",
+                            annotation1.findAttributeValue("str")!!,
+                            annotation2.findAttributeValue("str"))
+
+    }
+
     private fun assertTextAndRange(expected: String, psiElement: PsiElement) {
         TestCase.assertEquals(expected, psiElement.text)
         TestCase.assertEquals(expected, psiElement.textRange.substring(psiElement.containingFile.text))

@@ -16,11 +16,17 @@
 
 package org.jetbrains.kotlin.asJava.elements
 
+import com.intellij.openapi.util.Key
 import com.intellij.psi.PsiAnnotation
 import com.intellij.psi.PsiElement
 import com.intellij.psi.PsiModifierList
 import com.intellij.psi.PsiModifierListOwner
+import com.intellij.psi.util.CachedValue
+import com.intellij.psi.util.CachedValueProvider
+import com.intellij.psi.util.CachedValuesManager
+import com.intellij.psi.util.PsiModificationTracker
 import org.jetbrains.kotlin.asJava.LightClassGenerationSupport
+import org.jetbrains.kotlin.asJava.builder.LightClassDataHolder
 import org.jetbrains.kotlin.asJava.classes.KtLightClassForSourceDeclaration
 import org.jetbrains.kotlin.asJava.classes.lazyPub
 import org.jetbrains.kotlin.descriptors.ClassDescriptor
@@ -91,6 +97,9 @@ private fun computeAnnotations(lightModifierList: KtLightModifierList<*>): List<
     return annotationsForEntries
 }
 
+private val lightElementCached = Key.create<KtLightAnnotationForSourceEntry>("KtLightAnnotationForSourceEntryCached")
+
+
 private fun lightAnnotationsForEntries(lightModifierList: KtLightModifierList<*>): List<KtLightAnnotationForSourceEntry> {
     val lightModifierListOwner = lightModifierList.parent
     val annotatedKtDeclaration = lightModifierListOwner.kotlinOrigin as? KtDeclaration
@@ -109,10 +118,24 @@ private fun lightAnnotationsForEntries(lightModifierList: KtLightModifierList<*>
             .flatMap {
                 (fqName, entries) ->
                 entries.mapIndexed { index, entry ->
+//                    //                    CachedValuesManager.getCachedValue<KtLightAnnotationForSourceEntry>(entry, CachedValueProvider {
+////                        val lightEntry = KtLightAnnotationForSourceEntry(fqName, entry, lightModifierList) {
+////                            lightModifierList.clsDelegate.annotations.filter { it.qualifiedName == fqName }.getOrNull(index)
+////                            ?: KtLightNonExistentAnnotation(lightModifierList)
+////                        }
+////                        CachedValueProvider.Result.create(lightEntry, PsiModificationTracker.MODIFICATION_COUNT)
+////                    })
+                    entry.getUserData(lightElementCached) ?:
                     KtLightAnnotationForSourceEntry(fqName, entry, lightModifierList) {
                         lightModifierList.clsDelegate.annotations.filter { it.qualifiedName == fqName }.getOrNull(index)
                         ?: KtLightNonExistentAnnotation(lightModifierList)
+                    }.also {
+                        entry.putUserData(lightElementCached, it)
                     }
+//                    KtLightAnnotationForSourceEntry(fqName, entry, lightModifierList) {
+//                        lightModifierList.clsDelegate.annotations.filter { it.qualifiedName == fqName }.getOrNull(index)
+//                        ?: KtLightNonExistentAnnotation(lightModifierList)
+//                    }
                 }
             }
 }

@@ -16,6 +16,7 @@
 
 package org.jetbrains.kotlin.asJava.elements
 
+import com.intellij.openapi.util.Key
 import com.intellij.openapi.util.TextRange
 import com.intellij.openapi.util.text.StringUtil
 import com.intellij.psi.*
@@ -230,9 +231,12 @@ class KtLightAnnotationForSourceEntry(
 
     override fun getName() = null
 
-    private fun wrapAnnotationValue(value: PsiAnnotationMemberValue): PsiAnnotationMemberValue = wrapAnnotationValue(value, this, {
-        getMemberValueAsCallArgument(value, kotlinOrigin)
-    })
+    private val lightElementCached = Key.create<PsiAnnotationMemberValue>("KtLightAnnotationForSourceEntryCached")
+
+    private fun wrapAnnotationValue(value: PsiAnnotationMemberValue): PsiAnnotationMemberValue =
+            value.getUserData(lightElementCached) ?: wrapAnnotationValue(value, this, {
+                getMemberValueAsCallArgument(value, kotlinOrigin)
+            }).also { value.putUserData(lightElementCached, it) }
 
     override fun findAttributeValue(name: String?) = clsDelegate.findAttributeValue(name)?.let { wrapAnnotationValue(it) }
 
