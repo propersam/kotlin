@@ -42,8 +42,8 @@ dependencies {
     compile project(path: ':kotlin-annotation-processing-gradle', configuration: "runtimeJar")
 
     compileOnly 'com.android.tools.build:gradle:2.0.0'
-    compileOnly 'org.codehaus.groovy:groovy-all:2.3.9'
-    compileOnly 'org.jetbrains.kotlin:gradle-api:2.2'
+    compileOnly 'org.codehaus.groovy:groovy-all:2.4.11'
+    compileOnly gradleApi()
 
     agp25CompileOnly 'com.android.tools.build:gradle:3.0.0-alpha1'
     agp25CompileOnly 'org.codehaus.groovy:groovy-all:2.3.9'
