@@ -17,9 +17,9 @@ fun Project.kotlinBootstrapFrom(defaultSource: BootstrapOption) {
     val bootstrapTeamCityVersion = project.findProperty("bootstrap.teamcity.kotlin.version") as String?
 
     val bootstrapSource = when {
-        bootstrapVersion != null -> BootstrapOption.Custom(kotlinVersion = bootstrapVersion, repo = bootstrapRepo)
+        project.hasProperty("bootstrap.local") -> BootstrapOption.Local(project.findProperty("bootstrap.local.version") as String?, project.findProperty("bootstrap.local.path") as String?)
         bootstrapTeamCityVersion != null -> BootstrapOption.TeamCity(bootstrapTeamCityVersion, onlySuccessBootstrap = false)
-        project.hasProperty("bootstrap.local") -> BootstrapOption.Local(project.findProperty("bootstrap.local.version") as String?)
+        bootstrapVersion != null -> BootstrapOption.Custom(kotlinVersion = bootstrapVersion, repo = bootstrapRepo)
         else -> defaultSource
     }
 
@@ -42,10 +42,8 @@ sealed class BootstrapOption {
     }
     /** Get bootstrap from kotlin-dev bintray repo, where bootstraps are published */
     class BintrayDev(val kotlinVersion: String) : BootstrapOption() {
-        override fun applyToProject(project: Project) {
-            project.bootstrapKotlinVersion = kotlinVersion
-            project.bootstrapKotlinRepo = "https://dl.bintray.com/kotlin/kotlin-dev"
-        }
+        override fun applyToProject(project: Project) =
+                Custom(kotlinVersion, "https://dl.bintray.com/kotlin/kotlin-dev").applyToProject(project)
     }
     /** Get bootstrap from teamcity maven artifacts of the specified build configuration
      *
@@ -64,9 +62,14 @@ sealed class BootstrapOption {
     /**
      * Use previously published local artifacts from the build/repo maven repository
      */
-    class Local(val kotlinVersion: String? = null) : BootstrapOption() {
+    class Local(val kotlinVersion: String? = null, val localPath: String? = null) : BootstrapOption() {
         override fun applyToProject(project: Project) {
-            project.bootstrapKotlinRepo = project.buildDir.resolve("repo").toURI().toString()
+            val repoPath = if (localPath != null)
+                project.projectDir.resolve(localPath).canonicalFile
+            else
+                project.buildDir.resolve("repo")
+
+            project.bootstrapKotlinRepo = repoPath.toURI().toString()
             project.bootstrapKotlinVersion = kotlinVersion ?: project.property("defaultSnapshotVersion") as String
         }
     }
