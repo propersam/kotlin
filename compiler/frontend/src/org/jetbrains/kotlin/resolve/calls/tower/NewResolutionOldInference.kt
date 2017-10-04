@@ -16,20 +16,27 @@
 
 package org.jetbrains.kotlin.resolve.calls.tower
 
+import org.jetbrains.kotlin.builtins.isFunctionType
 import org.jetbrains.kotlin.config.LanguageFeature
 import org.jetbrains.kotlin.config.LanguageVersionSettings
 import org.jetbrains.kotlin.descriptors.CallableDescriptor
 import org.jetbrains.kotlin.descriptors.DeclarationDescriptor
 import org.jetbrains.kotlin.descriptors.FunctionDescriptor
 import org.jetbrains.kotlin.descriptors.VariableDescriptor
+import org.jetbrains.kotlin.descriptors.annotations.AnnotationDescriptor
+import org.jetbrains.kotlin.descriptors.synthetic.SyntheticMemberDescriptor
 import org.jetbrains.kotlin.diagnostics.Errors
 import org.jetbrains.kotlin.incremental.components.LookupLocation
+import org.jetbrains.kotlin.load.java.descriptors.JavaClassDescriptor
+import org.jetbrains.kotlin.load.java.descriptors.JavaMethodDescriptor
+import org.jetbrains.kotlin.name.FqName
 import org.jetbrains.kotlin.name.Name
 import org.jetbrains.kotlin.psi.Call
 import org.jetbrains.kotlin.psi.KtReferenceExpression
 import org.jetbrains.kotlin.resolve.BindingContext
 import org.jetbrains.kotlin.resolve.DeprecationResolver
 import org.jetbrains.kotlin.resolve.TemporaryBindingTrace
+import org.jetbrains.kotlin.resolve.annotations.argumentValue
 import org.jetbrains.kotlin.resolve.calls.CallTransformer
 import org.jetbrains.kotlin.resolve.calls.CandidateResolver
 import org.jetbrains.kotlin.resolve.calls.callResolverUtil.isBinaryRemOperator
@@ -38,6 +45,7 @@ import org.jetbrains.kotlin.resolve.calls.callResolverUtil.isInfixCall
 import org.jetbrains.kotlin.resolve.calls.callUtil.createLookupLocation
 import org.jetbrains.kotlin.resolve.calls.context.*
 import org.jetbrains.kotlin.resolve.calls.inference.CoroutineInferenceSupport
+import org.jetbrains.kotlin.resolve.calls.inference.returnTypeOrNothing
 import org.jetbrains.kotlin.resolve.calls.model.KotlinCallKind
 import org.jetbrains.kotlin.resolve.calls.model.*
 import org.jetbrains.kotlin.resolve.calls.results.OverloadResolutionResultsImpl
@@ -46,19 +54,21 @@ import org.jetbrains.kotlin.resolve.calls.results.ResolutionStatus
 import org.jetbrains.kotlin.resolve.calls.smartcasts.DataFlowInfo
 import org.jetbrains.kotlin.resolve.calls.smartcasts.DataFlowValueFactory
 import org.jetbrains.kotlin.resolve.calls.tasks.*
+import org.jetbrains.kotlin.resolve.calls.util.CallMaker
 import org.jetbrains.kotlin.resolve.descriptorUtil.hasDynamicExtensionAnnotation
 import org.jetbrains.kotlin.resolve.scopes.LexicalScope
 import org.jetbrains.kotlin.resolve.scopes.MemberScope
 import org.jetbrains.kotlin.resolve.scopes.SyntheticScopes
+import org.jetbrains.kotlin.resolve.scopes.getDescriptorsFiltered
 import org.jetbrains.kotlin.resolve.scopes.receivers.*
-import org.jetbrains.kotlin.types.DeferredType
-import org.jetbrains.kotlin.types.ErrorUtils
+import org.jetbrains.kotlin.types.*
+import org.jetbrains.kotlin.types.checker.KotlinTypeChecker
 import org.jetbrains.kotlin.types.expressions.OperatorConventions
-import org.jetbrains.kotlin.types.isDynamic
+import org.jetbrains.kotlin.types.typeUtil.supertypes
 import org.jetbrains.kotlin.util.OperatorNameConventions
 import org.jetbrains.kotlin.utils.sure
 import java.lang.IllegalStateException
-import java.util.*
+import kotlin.collections.HashMap
 
 class NewResolutionOldInference(
         private val candidateResolver: CandidateResolver,
@@ -141,6 +151,141 @@ class NewResolutionOldInference(
         }
     }
 
+    private class CompatCandidate(
+            // Call candidate to check
+            val candidate: MyCandidate,
+            // All classes and interfaces, annotated with @Compat mapped to their compat companions
+            val compatClasses: Map<KotlinType, SimpleType>
+    )
+
+    private fun replaceWithCompatCallIfNeeded(candidates: Collection<MyCandidate>): Collection<MyCandidate> {
+        // Find all compat classes of the type and its supertypes including interfaces
+        fun findCompatClasses(type: KotlinType): Map<KotlinType, SimpleType> {
+            // Find all compat annotations on the type and its supertypes
+            fun findCompatAnnotations(): Map<KotlinType, AnnotationDescriptor> {
+                fun findCompatAnnotationOnType(t: KotlinType) =
+                        t.constructor.declarationDescriptor?.annotations?.firstOrNull { it.fqName == FqName("Compat") }
+
+                val allTypes = type.supertypes() + type
+                val res = hashMapOf<KotlinType, AnnotationDescriptor>()
+                for (t in allTypes) {
+                    val annotation = findCompatAnnotationOnType(t)
+                    if (annotation != null) res[t] = annotation
+                }
+                return res
+            }
+
+            val res = hashMapOf<KotlinType, SimpleType>()
+            for ((t, annotation) in findCompatAnnotations()) {
+                res[t] = annotation.argumentValue("value") as? SimpleType ?: continue
+            }
+            return res
+        }
+
+        fun functionSignaturesEqual(
+                call: CallableDescriptor,
+                candidate: CallableDescriptor,
+                scope: MemberScope,
+                originType: KotlinType? = null,
+                receiverType: KotlinType? = null
+        ): Boolean {
+            if (call.name != candidate.name) return false
+            if (!KotlinTypeChecker.DEFAULT.equalTypes(call.returnTypeOrNothing, candidate.returnTypeOrNothing)) return false
+            if (call.typeParameters.size != candidate.typeParameters.size) return false
+            if (call.typeParameters.indices.any { call.typeParameters[it] != candidate.typeParameters[it] }) return false
+            if (call.valueParameters.size + (if (originType != null) 1 else 0) != candidate.valueParameters.size) return false
+            if (originType != null && !KotlinTypeChecker.DEFAULT.equalTypes(originType, candidate.valueParameters[0].type)) return false
+            for (i in call.valueParameters.indices) {
+                val j = if (originType != null) i + 1 else i
+                // Check for sam adapters
+                if (KotlinTypeChecker.DEFAULT.equalTypes(candidate.valueParameters[j].type, call.valueParameters[i].type)) continue
+                if (call.valueParameters[i].type.isFunctionType) {
+                    val synthetics = syntheticScopes.scopes.flatMap {
+                        if (receiverType == null) it.getSyntheticStaticFunctions(scope)
+                        else it.getSyntheticMemberFunctions(listOf(receiverType))
+                    }
+                    val originFun = synthetics.firstOrNull {
+                        functionSignaturesEqual(call, it, scope)
+                    } as? SyntheticMemberDescriptor<*> ?: return false
+                    val realParam = (originFun.baseDescriptorForSynthetic as? JavaMethodDescriptor)?.valueParameters?.get(i) ?: return false
+                    if (!KotlinTypeChecker.DEFAULT.equalTypes(candidate.valueParameters[j].type, realParam.type)) return false
+                }
+                else return false
+            }
+            return true
+        }
+
+        val compatCandidates = arrayListOf<CompatCandidate>()
+        for (candidate in candidates) {
+            val call = candidate.resolvedCall
+            val receiver = call.dispatchReceiver ?: continue
+            val compatClasses = findCompatClasses(receiver.type)
+            if (compatClasses.isNotEmpty()) compatCandidates += CompatCandidate(candidate, compatClasses)
+        }
+        if (compatCandidates.isEmpty()) return candidates
+
+        // Calls with appropriate compat
+        val callsToReplace = hashMapOf<MyCandidate, MyCandidate>()
+        // Most of these loops iterate only once. It's OK to let them nest
+        for (compatCandidate in compatCandidates) {
+            val resolvedCall = compatCandidate.candidate.resolvedCall
+            val callDescriptor = resolvedCall.candidateDescriptor ?: continue
+            val receiver = resolvedCall.dispatchReceiver ?: continue
+            val receiverExpr = (receiver as? ExpressionReceiver)?.expression ?: continue
+
+            // Find appropriate compat class/method and replace the call
+            for ((origin, compat) in compatCandidate.compatClasses) {
+                val scope = (compat.constructor.declarationDescriptor as? JavaClassDescriptor)?.staticScope ?: continue
+                var compatMethod: CallableDescriptor? = null
+                // Find method in compat class
+                for (compatMethodDescriptor in scope.getDescriptorsFiltered { it == callDescriptor.name }) {
+                    if (compatMethodDescriptor !is JavaMethodDescriptor) continue
+                    if (!functionSignaturesEqual(callDescriptor, compatMethodDescriptor, scope, origin, receiver.type)) continue
+                    val tmp = syntheticScopes.scopes.flatMap { it.getSyntheticStaticFunctions(scope) }
+                    compatMethod = tmp.firstOrNull {
+                        functionSignaturesEqual(callDescriptor, it, scope, origin)
+                    } ?: compatMethodDescriptor
+                }
+                if (compatMethod == null) continue
+
+                // Replace the call
+                // TODO: Hack
+                val originValue = CallMaker.makeValueArgument(receiverExpr)
+                val compatCall = CallMaker.makeCall(
+                        resolvedCall.call.callElement,
+                        null,
+                        resolvedCall.call.callOperationNode,
+                        // TODO: Change callee expression to appropriate one
+                        resolvedCall.call.calleeExpression,
+                        listOf(originValue) + resolvedCall.call.valueArguments
+                )
+                val compatResolverCall = ResolvedCallImpl(
+                        compatCall,
+                        compatMethod,
+                        null,
+                        null,
+                        ExplicitReceiverKind.NO_EXPLICIT_RECEIVER,
+                        resolvedCall.knownTypeParametersSubstitutor,
+                        resolvedCall.trace,
+                        resolvedCall.tracingStrategy,
+                        resolvedCall.dataFlowInfoForArguments
+                )
+                compatResolverCall.recordValueArgument(compatMethod.valueParameters.first(), ExpressionValueArgument(originValue))
+                resolvedCall.valueArguments.forEach {
+                    compatResolverCall.recordValueArgument(compatMethod!!.valueParameters[it.key.index + 1], it.value)
+                }
+                compatResolverCall.setStatusToSuccess()
+                callsToReplace[compatCandidate.candidate] = MyCandidate(compatCandidate.candidate.diagnostics, compatResolverCall)
+            }
+        }
+
+        if (callsToReplace.isEmpty()) return candidates
+
+        val res = arrayListOf<MyCandidate>()
+        for (candidate in candidates) res += callsToReplace[candidate] ?: candidate
+        return res
+    }
+
     fun <D : CallableDescriptor> runResolution(
             context: BasicCallResolutionContext,
             name: Name,
@@ -182,6 +327,8 @@ class NewResolutionOldInference(
             candidates = towerResolver.runResolve(scopeTower, processorForDeprecatedName, useOrder = kind != ResolutionKind.CallableReference, name = deprecatedName)
         }
 
+        candidates = replaceWithCompatCallIfNeeded(candidates)
+
         if (candidates.isEmpty()) {
             if (reportAdditionalDiagnosticIfNoCandidates(context, nameToResolve, kind, scopeTower, detailedReceiver)) {
                 return OverloadResolutionResultsImpl.nameNotFound()
@@ -217,17 +364,17 @@ class NewResolutionOldInference(
         }
         if (basicCallContext.collectAllCandidates) {
             val allCandidates = towerResolver.runWithEmptyTowerData(KnownResultProcessor(resolvedCandidates),
-                                                  TowerResolver.AllCandidatesCollector(), useOrder = false)
+                                                                    TowerResolver.AllCandidatesCollector(), useOrder = false)
             return allCandidatesResult(allCandidates)
         }
 
         val processedCandidates = towerResolver.runWithEmptyTowerData(KnownResultProcessor(resolvedCandidates),
-                                                    TowerResolver.SuccessfulResultCollector(), useOrder = true)
+                                                                      TowerResolver.SuccessfulResultCollector(), useOrder = true)
 
         return convertToOverloadResults(processedCandidates, tracing, basicCallContext, languageVersionSettings)
     }
 
-    private fun <D: CallableDescriptor> allCandidatesResult(allCandidates: Collection<MyCandidate>)
+    private fun <D : CallableDescriptor> allCandidatesResult(allCandidates: Collection<MyCandidate>)
             = OverloadResolutionResultsImpl.nameNotFound<D>().apply {
         this.allCandidates = allCandidates.map { it.resolvedCall as MutableResolvedCall<D> }
     }
@@ -249,7 +396,8 @@ class NewResolutionOldInference(
 
                 resolvedCall.functionCall.tracingStrategy.bindReference(resolvedCall.functionCall.trace, resolvedCall.functionCall)
                 //                resolvedCall.hackInvokeTracing.bindResolvedCall(resolvedCall.functionCall.trace, resolvedCall)
-            } else {
+            }
+            else {
                 tracing.bindReference(resolvedCall.trace, resolvedCall)
                 tracing.bindResolvedCall(resolvedCall.trace, resolvedCall)
             }
@@ -302,7 +450,7 @@ class NewResolutionOldInference(
             override val dynamicScope: MemberScope,
             override val syntheticScopes: SyntheticScopes,
             override val location: LookupLocation
-    ): ImplicitScopeTower {
+    ) : ImplicitScopeTower {
         private val cache = HashMap<ReceiverValue, ReceiverValueWithSmartCastInfo>()
 
         override fun getImplicitReceiver(scope: LexicalScope): ReceiverValueWithSmartCastInfo? =
@@ -354,7 +502,7 @@ class NewResolutionOldInference(
 
                 if (parameterIsDynamic != argumentIsDynamic ||
                     (parameterIsDynamic && !towerCandidate.descriptor.hasDynamicExtensionAnnotation())
-                ) {
+                        ) {
                     return MyCandidate(listOf(HiddenExtensionRelatedToDynamicTypes), candidateCall)
                 }
             }
@@ -471,7 +619,7 @@ fun transformToReceiverWithSmartCastInfo(
 }
 
 @Deprecated("Temporary error")
-internal class PreviousResolutionError(candidateLevel: ResolutionCandidateApplicability): ResolutionDiagnostic(candidateLevel)
+internal class PreviousResolutionError(candidateLevel: ResolutionCandidateApplicability) : ResolutionDiagnostic(candidateLevel)
 
 @Deprecated("Temporary error")
 internal fun createPreviousResolveError(status: ResolutionStatus): PreviousResolutionError? {
